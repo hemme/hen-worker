@@ -1,0 +1,13 @@
+name = "hen"
+main = "index.js"
+compatibility_date = "2026-05-23"
+compatibility_flags = ["nodejs_compat"]
+
+rules = [
+  { type = "CompiledWasm", globs = ["**/*.wasm"], fallthrough = true },
+  { type = "Data", globs = ["**/*.ttf"], fallthrough = true }
+]
+
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "YOUR_RATE_LIMIT_KV_ID"

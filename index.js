@@ -1,0 +1,648 @@
+import { Resvg, initWasm } from '@resvg/resvg-wasm';
+import wasmModule from '@resvg/resvg-wasm/index_bg.wasm';
+import fontData from './fonts/Roboto-Regular.ttf';
+
+const RATE_LIMIT = 20;      // Max allowed requests
+const RATE_LIMIT_WINDOW = 60;     // Time window in seconds (e.g. 1 minute)
+
+const EMPTY = 0;
+const BLACK = 1;
+const WHITE = 2;
+const HEN_LETTERS = 'ABCDEFGHJKLMNOPQRST';
+const STAR_POINTS = {
+  5: [[2, 2]],
+  7: [[1, 1], [1, 5], [3, 3], [5, 1], [5, 5]],
+  9: [[2, 2], [2, 6], [4, 4], [6, 2], [6, 6]],
+  13: [[3, 3], [3, 6], [3, 9], [6, 3], [6, 6], [6, 9], [9, 3], [9, 6], [9, 9]],
+  19: [[3, 3], [3, 9], [3, 15], [9, 3], [9, 9], [9, 15], [15, 3], [15, 9], [15, 15]],
+};
+
+let wasmInitialized = false;
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[n] = c;
+  }
+  return table;
+})();
+
+function crc32(buf) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) {
+    crc = CRC_TABLE[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function insertPngTextChunk(pngBuffer, keyword, text) {
+  const kwBytes = new TextEncoder().encode(keyword);
+  const txtBytes = new TextEncoder().encode(text);
+  const dataLen = kwBytes.length + 1 + txtBytes.length;
+  const chunkLen = 4 + 4 + dataLen + 4;
+
+  const typeBytes = new TextEncoder().encode('tEXt');
+  const dataForCrc = new Uint8Array(4 + dataLen);
+  dataForCrc.set(typeBytes, 0);
+  dataForCrc.set(kwBytes, 4);
+  dataForCrc[kwBytes.length + 4] = 0;
+  dataForCrc.set(txtBytes, kwBytes.length + 5);
+  const checksum = crc32(dataForCrc);
+
+  let insertPos = pngBuffer.length - 12;
+  let offset = 8;
+  while (offset < pngBuffer.length - 8) {
+    const chunkType = String.fromCharCode(
+      pngBuffer[offset + 4], pngBuffer[offset + 5],
+      pngBuffer[offset + 6], pngBuffer[offset + 7]
+    );
+    if (chunkType === 'IDAT') {
+      insertPos = offset;
+      break;
+    }
+    const chunkDataLen = (pngBuffer[offset] << 24) | (pngBuffer[offset + 1] << 16) |
+                         (pngBuffer[offset + 2] << 8) | pngBuffer[offset + 3];
+    offset += 12 + chunkDataLen;
+  }
+
+  const chunk = new Uint8Array(chunkLen);
+  const view = new DataView(chunk.buffer);
+  view.setUint32(0, dataLen, false);
+  chunk.set(typeBytes, 4);
+  chunk.set(kwBytes, 8);
+  chunk[kwBytes.length + 8] = 0;
+  chunk.set(txtBytes, kwBytes.length + 9);
+  view.setUint32(chunkLen - 4, checksum, false);
+
+  const result = new Uint8Array(pngBuffer.length + chunkLen);
+  result.set(pngBuffer.subarray(0, insertPos), 0);
+  result.set(chunk, insertPos);
+  result.set(pngBuffer.subarray(insertPos), insertPos + chunkLen);
+  return result;
+}
+
+// Normalize IP (truncates IPv6 to /64)
+function getNormalizedIP(request) {
+  let ip = request.headers.get("CF-Connecting-IP");
+  
+  if (ip && ip.includes(':')) {
+    // It's an IPv6. Split the blocks.
+    const parts = ip.split(':');
+    // Keep only the first 4 blocks (first 64 bits) and zero the rest.
+    // Example: 2a01:827:2277:be00:... becomes 2a01:827:2277:be00::
+    ip = parts.slice(0, 4).join(':') + '::';
+  }
+  
+  return ip;
+}
+
+async function checkRateLimit(request, env, ctx) {
+
+    // 1. Get the client IP
+    const ip = getNormalizedIP(request);
+    
+    if (!ip) {
+      return new Response("Unable to determine IP", { status: 400 });
+    }
+
+    // 2. Generate a unique KV key
+    // Format: rate_limit:123.123.123.123
+    // For normalized IPv6: rate_limit:2a01:827:2277:be00::
+    const key = `rate_limit:${ip}`;
+    
+    // 3. Read current state from KV
+    const now = Math.floor(Date.now() / 1000);
+    let data = await env.RATE_LIMIT.get(key, { type: 'json' });
+
+    // 4. Reset or increment logic
+    if (!data || now > data.resetTime) {
+      // First request or window expired, reset
+      data = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
+      await env.RATE_LIMIT.put(key, JSON.stringify(data), { expirationTtl: RATE_LIMIT_WINDOW + 10 });
+    } else {
+      // Increment the counter
+      data.count += 1;
+      // Save the new state (use ctx.waitUntil to avoid blocking the response)
+      ctx.waitUntil(env.RATE_LIMIT.put(key, JSON.stringify(data), { expirationTtl: RATE_LIMIT_WINDOW + 10 }));
+    }
+
+    // 5. Check if limit is exceeded
+    if (data.count > RATE_LIMIT) {
+      return new Response("Too many requests. Try again in a minute.", { 
+        status: 429, // Too Many Requests
+        headers: { 
+          "Retry-After": RATE_LIMIT_WINDOW,
+          "Content-Type": "text/plain"
+        }
+      });
+    }
+
+    return null; // All good
+}
+
+export default {
+  async fetch(request, env, ctx) {
+
+    const rateLimitResponse = await checkRateLimit(request,env,ctx);
+    if (rateLimitResponse) {
+      return rateLimitResponse;
+    }
+    
+    const url = new URL(request.url);
+    const pathname = url.pathname; // e.g. /hen.19x19.b_16DbQw.png
+
+    if (!pathname.endsWith('.png')) {
+      return new Response('Not Found or Invalid Format', { status: 404 });
+    }
+
+    let henStartIndex = pathname.indexOf('/hen');
+    if (henStartIndex === -1) {
+      return new Response('Not Found or Invalid Format', { status: 404 });
+    }
+
+    let optionsStr = '';
+    if (henStartIndex > 0) {
+      optionsStr = pathname.substring(1, henStartIndex);
+    }
+
+    const showCoordinates = optionsStr.includes('c');
+
+    const cache = caches.default;
+    let cachedResponse = await cache.match(request);
+    if (cachedResponse) return cachedResponse;
+
+    const henString = pathname.substring(henStartIndex + 4, pathname.length - 4);
+
+    try {
+      const svgString = generateGobanSVG(henString, { showCoordinates });
+
+      if (!wasmInitialized) {
+        await initWasm(wasmModule);
+        wasmInitialized = true;
+      }
+
+      const font = new Uint8Array(fontData);
+
+      const resvg = new Resvg(svgString, {
+        fitTo: { mode: 'width', value: 1000 },
+        font: {
+          fontBuffers: [font],   // provides the TTF font to Resvg
+          defaultFontFamily: 'Roboto',
+          serifFamilyType: 'Roboto',
+          sansSerifFamilyType: 'Roboto',
+          monspaceFamilyType: 'Roboto',
+        },
+      });
+      let pngBuffer = resvg.render().asPng();
+      pngBuffer = insertPngTextChunk(pngBuffer, 'HEN', henString);
+      pngBuffer = insertPngTextChunk(pngBuffer, 'Software', 'hen-worker (c) 2026 hemme');
+
+      const response = new Response(pngBuffer, {
+        headers: {
+          'Content-Type': 'image/png',
+          'Cache-Control': 'public, max-age=31536000, immutable',
+        },
+      });
+
+      ctx.waitUntil(cache.put(request, response.clone()));
+
+      return response;
+
+    } catch (error) {
+      return new Response(`Rendering error: ${error.message}`, { status: 400 });
+    }
+  }
+};
+
+// ─── Parsing HEN ──────────────────────────────────────────────────────────────
+
+function henLetterToIndex(letter) {
+  return HEN_LETTERS.indexOf(letter.toUpperCase());
+}
+
+function henStoneToColor(ch) {
+  if (ch === 'b') return BLACK;
+  if (ch === 'w') return WHITE;
+  return EMPTY;
+}
+
+function parseHen(hen) {
+  if (!hen) return null;
+  hen = decodeURIComponent(hen).trim().replace(/[\s\n\r]+/g, '');
+
+  var result = {
+    size: 19,
+    board: null,
+    koPoint: null,
+    lastMove: null,
+    turn: null,
+    labels: [],
+    marks: [],
+    numberedStones: [],
+    playerOrder: null,
+  };
+
+  var i = 0;
+  var len = hen.length;
+
+  var firstDelim = hen.search(/[._~]/);
+  if (firstDelim === -1) firstDelim = len;
+  if (firstDelim > 0) {
+    _parseHenDotPart(hen.slice(0, firstDelim), result);
+    i = firstDelim;
+  }
+
+  while (i < len) {
+    if (hen[i] === '.') {
+      i++;
+      var partStart = i;
+      while (i < len) {
+        if (hen[i] === '.' || hen[i] === '_') break;
+        if (hen[i] === '~') {
+          if (i + 1 < len && 'bwrglyp'.indexOf(hen[i + 1]) !== -1) break;
+        }
+        i++;
+      }
+      var part = hen.slice(partStart, i);
+      _parseHenDotPart(part, result);
+    } else if (hen[i] === '_') {
+      i++;
+      var rowStart = i;
+      while (i < len) {
+        if (hen[i] === '_' || hen[i] === '.') break;
+        if (hen[i] === '~') {
+          if (i + 1 < len && hen[i + 1] >= '0' && hen[i + 1] <= '9') {
+            i++;
+            continue;
+          }
+          break;
+        }
+        i++;
+      }
+      var rowPart = hen.slice(rowStart, i);
+      _parseHenRow(rowPart, result);
+    } else if (hen[i] === '~') {
+      i++;
+      var poStart = i;
+      while (i < len && hen[i] !== '.' && hen[i] !== '_' && hen[i] !== '~') i++;
+      var poPart = hen.slice(poStart, i);
+      result.playerOrder = [];
+      for (var pi = 0; pi < poPart.length; pi++) {
+        if ('bwrglyp'.indexOf(poPart[pi]) !== -1) {
+          result.playerOrder.push(poPart[pi]);
+        }
+      }
+    } else {
+      i++;
+    }
+  }
+
+  if (!result.board) {
+    result.board = Array(result.size).fill(null).map(function () {
+      return Array(result.size).fill(EMPTY);
+    });
+  }
+
+  if (result.numberedStones.length > 0) {
+    var po = result.playerOrder || ['b', 'w'];
+    result.numberedStones.forEach(function (ns) {
+      var colorIdx = (ns.number - 1) % po.length;
+      var stoneChar = po[colorIdx];
+      result.board[ns.row][ns.col] = henStoneToColor(stoneChar);
+    });
+  }
+
+  return result;
+}
+
+function _parseHenDotPart(part, result) {
+  if (!part) return;
+
+  var sizeMatch = part.match(/^(\d+)x(\d+)$/);
+  if (sizeMatch) {
+    result.size = parseInt(sizeMatch[1], 10);
+    if (!result.board) {
+      result.board = Array(result.size).fill(null).map(function () {
+        return Array(result.size).fill(EMPTY);
+      });
+    }
+    return;
+  }
+
+  if (part === 'b' || part === 'w') {
+    result.turn = part;
+    return;
+  }
+
+  if (part.length >= 2 && part[0] === 'p') {
+    var passStone = part[1];
+    if (passStone === 'b' || passStone === 'w') {
+      result.lastMove = { color: henStoneToColor(passStone), pass: true };
+      return;
+    }
+  }
+
+  var lastMoveMatch = part.match(/^([A-HJ-T])(\d+)([bw])$/);
+  if (lastMoveMatch) {
+    var col = henLetterToIndex(lastMoveMatch[1]);
+    var row = result.size - parseInt(lastMoveMatch[2], 10);
+    var stoneColor = henStoneToColor(lastMoveMatch[3]);
+    result.lastMove = { row: row, col: col, color: stoneColor, pass: false };
+    return;
+  }
+
+  var koMatch = part.match(/^([A-HJ-T])(\d+)$/);
+  if (koMatch) {
+    var koCol = henLetterToIndex(koMatch[1]);
+    var koRow = result.size - parseInt(koMatch[2], 10);
+    result.koPoint = { row: koRow, col: koCol };
+    return;
+  }
+
+  var labelMarkMatch = part.match(/^([A-HJ-T])(\d+)-(.+)$/);
+  if (labelMarkMatch) {
+    var lmCol = henLetterToIndex(labelMarkMatch[1]);
+    var lmRow = result.size - parseInt(labelMarkMatch[2], 10);
+    var val = labelMarkMatch[3];
+    if (val === 'CR' || val === 'SQ' || val === 'TR' || val === 'MA') {
+      result.marks.push({ row: lmRow, col: lmCol, mark: val });
+    } else {
+      result.labels.push({ row: lmRow, col: lmCol, letter: val });
+    }
+  }
+}
+
+function _parseHenRow(part, result) {
+  if (!part) return;
+
+  var rowStart = 0;
+  while (rowStart < part.length && part[rowStart] >= '0' && part[rowStart] <= '9') {
+    rowStart++;
+  }
+  if (rowStart === 0) return;
+
+  var rowNum = result.size - parseInt(part.slice(0, rowStart), 10);
+  if (isNaN(rowNum) || rowNum < 0 || rowNum >= result.size) return;
+
+  if (!result.board) {
+    result.board = Array(result.size).fill(null).map(function () {
+      return Array(result.size).fill(EMPTY);
+    });
+  }
+
+  var j = rowStart;
+  var col = -1;
+  var prevStone = null;
+
+  if (j < part.length && part[j] >= 'A' && part[j] <= 'T' && part[j] !== 'I') {
+    col = henLetterToIndex(part[j]);
+    j++;
+  } else {
+    col = 0;
+  }
+
+  while (j < part.length) {
+    var ch = part[j];
+    if (ch >= 'A' && ch <= 'T' && ch !== 'I') {
+      col = henLetterToIndex(ch);
+      j++;
+    } else if (ch === 'b' || ch === 'w') {
+      if (col < result.size) {
+        result.board[rowNum][col] = henStoneToColor(ch);
+      }
+      prevStone = ch;
+      col++;
+      j++;
+    } else if (ch >= '0' && ch <= '9' && prevStone) {
+      var numStart = j;
+      while (j < part.length && part[j] >= '0' && part[j] <= '9') j++;
+      var count = parseInt(part.slice(numStart, j), 10);
+      for (var k = 1; k < count; k++) {
+        if (col < result.size) {
+          result.board[rowNum][col] = henStoneToColor(prevStone);
+        }
+        col++;
+      }
+    } else if (ch === '~') {
+      j++;
+      var mvNumStart = j;
+      while (j < part.length && part[j] >= '0' && part[j] <= '9') j++;
+      var moveNum = parseInt(part.slice(mvNumStart, j), 10);
+      if (!isNaN(moveNum) && moveNum > 0) {
+        result.numberedStones.push({ row: rowNum, col: col, number: moveNum });
+      }
+      prevStone = null;
+      col++;
+    } else {
+      j++;
+    }
+  }
+}
+
+// ─── SVG Generation ──────────────────────────────────────────────────────────
+
+// Helper: emits an SVG <text> element with Roboto font
+function svgText(x, y, content, fontSize, fill, extraAttrs) {
+  extraAttrs = extraAttrs || '';
+  return '<text x="' + x + '" y="' + y + '"'
+    + ' text-anchor="middle"'
+    + ' dominant-baseline="central"'
+    + ' font-family="Roboto, sans-serif"'
+    + ' font-size="' + fontSize + '"'
+    + ' fill="' + fill + '"'
+    + extraAttrs
+    + '>' + content + '</text>';
+}
+
+function generateGobanSVG(hen, options) {
+  options = options || {};
+  var pos = parseHen(hen);
+  if (!pos || !pos.board) {
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000"><rect width="1000" height="1000" fill="#DCB35C"/></svg>';
+  }
+
+  var size = pos.size;
+  var board = pos.board;
+  var lastMove = pos.lastMove;
+  var marks = pos.marks || [];
+  var labels = pos.labels || [];
+  var numberedStones = pos.numberedStones || [];
+
+  // Scale everything by 10 to ensure text rendering doesn't hit small font limits
+  var pad = options.showCoordinates ? 70 : 40;
+  var boardArea = 1000 - pad * 2;
+  var step = boardArea / (size - 1);
+  var stoneR = step * 0.46;
+
+  var svg = '';
+  svg += '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000">';
+  svg += '<defs>';
+  svg += '<linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">';
+  svg += '<stop offset="0%" stop-color="#DCB35C"/>';
+  svg += '<stop offset="100%" stop-color="#B8963E"/>';
+  svg += '</linearGradient>';
+  svg += '<radialGradient id="bs" cx="35%" cy="30%" r="80%">';
+  svg += '<stop offset="0%" stop-color="#4a4a4a"/>';
+  svg += '<stop offset="50%" stop-color="#1a1a1a"/>';
+  svg += '<stop offset="100%" stop-color="#0a0a0a"/>';
+  svg += '</radialGradient>';
+  svg += '<radialGradient id="ws" cx="35%" cy="30%" r="80%">';
+  svg += '<stop offset="0%" stop-color="#ffffff"/>';
+  svg += '<stop offset="40%" stop-color="#e8e4dc"/>';
+  svg += '<stop offset="100%" stop-color="#c8c4bc"/>';
+  svg += '</radialGradient>';
+  svg += '<filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">';
+  svg += '<feDropShadow dx="2.2" dy="3.3" stdDeviation="3.3" flood-color="#000" flood-opacity="0.35"/>';
+  svg += '</filter>';
+  svg += '</defs>';
+
+  svg += '<rect width="1000" height="1000" fill="url(#bg)"/>';
+
+  // Create mask to clip the grid under labels
+  var labels = pos.labels || [];
+  svg += '<defs>';
+  svg += '<mask id="grid-mask">';
+  svg += '<rect width="1000" height="1000" fill="white"/>';
+  labels.forEach(function (l) {
+    if (!board[l.row] || board[l.row][l.col] === EMPTY) {
+      var lx = pad + l.col * step;
+      var ly = pad + l.row * step;
+      var len = l.letter.length;
+      var fs = (step * 0.5) * (len > 4 ? 0.45 : len > 3 ? 0.55 : len > 2 ? 0.65 : len > 1 ? 0.8 : 1);
+      var tw = (fs * 0.65) * len + step * 0.2;
+      var th = fs + step * 0.2;
+      svg += '<rect x="' + (lx - tw / 2) + '" y="' + (ly - th / 2) + '" width="' + tw + '" height="' + th + '" fill="black"/>';
+    }
+  });
+  svg += '</mask>';
+  svg += '</defs>';
+
+  svg += '<g mask="url(#grid-mask)">';
+  
+  // Grid
+  svg += '<g stroke="#3d2914" stroke-width="2.0" stroke-linecap="round">';
+  for (var i = 0; i < size; i++) {
+    var p = pad + i * step;
+    svg += '<line x1="' + p + '" y1="' + pad + '" x2="' + p + '" y2="' + (1000 - pad) + '"/>';
+    svg += '<line x1="' + pad + '" y1="' + p + '" x2="' + (1000 - pad) + '" y2="' + p + '"/>';
+  }
+  svg += '</g>';
+
+  svg += '<rect x="' + pad + '" y="' + pad + '" width="' + (1000 - pad * 2) + '" height="' + (1000 - pad * 2) + '" fill="none" stroke="#3d2914" stroke-width="5.0"/>';
+
+  // Star points
+  var starPts = STAR_POINTS[size] || [];
+  starPts.forEach(function (pt) {
+    var cx = pad + pt[1] * step;
+    var cy = pad + pt[0] * step;
+    var r = Math.max(4, Math.min(10, step * 0.19));
+    svg += '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="#3d2914"/>';
+  });
+  svg += '</g>';
+
+  // ── Coordinates (now uses <text> with Roboto) ──────────────────────────────
+  if (options.showCoordinates) {
+    var fontSize = Math.max(15, Math.min(35, step * 0.45));
+    var letterSpace = 'ABCDEFGHJKLMNOPQRST';
+    var coordColor = '#3d2914';
+    var fontWeight = ' font-weight="700"';
+
+    // Column letters (top and bottom)
+    for (var ci = 0; ci < size; ci++) {
+      var cx = pad + ci * step;
+      svg += svgText(cx, pad - 37, letterSpace[ci], fontSize, coordColor, fontWeight);
+      svg += svgText(cx, 1000 - pad + 38, letterSpace[ci], fontSize, coordColor, fontWeight);
+    }
+
+    // Row numbers (left and right)
+    for (var ri = 0; ri < size; ri++) {
+      var cy = pad + ri * step;
+      svg += svgText(pad - 40, cy, size - ri, fontSize, coordColor, fontWeight);
+      svg += svgText(1000 - pad + 42, cy, size - ri, fontSize, coordColor, fontWeight);
+    }
+  }
+
+  // Stones
+  for (var r = 0; r < size; r++) {
+    for (var c = 0; c < size; c++) {
+      if (board[r][c] === EMPTY) continue;
+      var sx = pad + c * step;
+      var sy = pad + r * step;
+      var isBlack = board[r][c] === BLACK;
+
+      svg += '<circle cx="' + sx + '" cy="' + sy + '" r="' + stoneR + '"';
+      if (isBlack) {
+        svg += ' fill="url(#bs)" filter="url(#shadow)"/>';
+      } else {
+        svg += ' fill="url(#ws)" filter="url(#shadow)"/>';
+      }
+    }
+  }
+
+  // Last move marker
+  if (lastMove && !lastMove.pass && lastMove.row >= 0 && lastMove.row < size && lastMove.col >= 0 && lastMove.col < size) {
+    var hasLabelOnLastMove = labels.some(function(l) { return l.row === lastMove.row && l.col === lastMove.col; }) ||
+                             numberedStones.some(function(ns) { return ns.row === lastMove.row && ns.col === lastMove.col; }) ||
+                             marks.some(function(m) { return m.row === lastMove.row && m.col === lastMove.col; });
+    if (!hasLabelOnLastMove) {
+      var lmx = pad + lastMove.col * step;
+      var lmy = pad + lastMove.row * step;
+      var isBlackLast = board[lastMove.row][lastMove.col] === BLACK;
+      var markStroke = isBlackLast ? '#FFFFFF' : '#3D2914';
+      svg += '<circle cx="' + lmx + '" cy="' + lmy + '" r="' + (step * 0.3) + '" fill="none" stroke="' + markStroke + '" stroke-width="' + (step * 0.03) + '"/>';
+    }
+  }
+
+  // Marks (CR, SQ, TR, MA)
+  marks.forEach(function (m) {
+    var mx = pad + m.col * step;
+    var my = pad + m.row * step;
+    var isBlackCell = board[m.row] && board[m.row][m.col] === BLACK;
+    var sc = isBlackCell ? '#FFFFFF' : '#3D2914';
+    var sw = step * 0.08;
+
+    if (m.mark === 'CR') {
+      var crSc = isBlackCell ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+      svg += '<circle cx="' + mx + '" cy="' + my + '" r="' + (stoneR * 0.45) + '" fill="none" stroke="' + crSc + '" stroke-width="' + (stoneR * 0.15) + '"/>';
+    } else if (m.mark === 'SQ') {
+      var sqS = step * 0.22;
+      svg += '<rect x="' + (mx - sqS) + '" y="' + (my - sqS) + '" width="' + (sqS * 2) + '" height="' + (sqS * 2) + '" fill="none" stroke="' + sc + '" stroke-width="' + sw + '"/>';
+    } else if (m.mark === 'TR') {
+      var trH = step * 0.32;
+      svg += '<polygon points="' + mx + ',' + (my - trH) + ' ' + (mx + trH * 0.866) + ',' + (my + trH * 0.5) + ' ' + (mx - trH * 0.866) + ',' + (my + trH * 0.5) + '" fill="none" stroke="' + sc + '" stroke-width="' + sw + '" stroke-linejoin="round"/>';
+    } else if (m.mark === 'MA') {
+      var xS = step * 0.22;
+      svg += '<line x1="' + (mx - xS) + '" y1="' + (my - xS) + '" x2="' + (mx + xS) + '" y2="' + (my + xS) + '" stroke="' + sc + '" stroke-width="' + sw + '" stroke-linecap="round"/>';
+      svg += '<line x1="' + (mx + xS) + '" y1="' + (my - xS) + '" x2="' + (mx - xS) + '" y2="' + (my + xS) + '" stroke="' + sc + '" stroke-width="' + sw + '" stroke-linecap="round"/>';
+    }
+  });
+
+  // Labels on stones (uses <text> with Roboto)
+  var annTextSize = step * 0.5;
+  labels.forEach(function (l) {
+    var lx = pad + l.col * step;
+    var ly = pad + l.row * step;
+    var isBlackCell = board[l.row] && board[l.row][l.col] === BLACK;
+    var fillC = isBlackCell ? '#FFFFFF' : '#3D2914';
+    var len = l.letter.length;
+    var fs = annTextSize * (len > 4 ? 0.45 : len > 3 ? 0.55 : len > 2 ? 0.65 : len > 1 ? 0.8 : 1);
+    svg += svgText(lx, ly, l.letter, fs, fillC, ' font-weight="700"');
+  });
+
+  // Numbers on stones (uses <text> with Roboto)
+  numberedStones.forEach(function (ns) {
+    var nx = pad + ns.col * step;
+    var ny = pad + ns.row * step;
+    var isBlackCell = board[ns.row] && board[ns.row][ns.col] === BLACK;
+    var fillC = isBlackCell ? '#FFFFFF' : '#3D2914';
+    var fs = annTextSize * (ns.number >= 100 ? 0.5 : ns.number >= 10 ? 0.65 : 0.8);
+    svg += svgText(nx, ny, ns.number, fs, fillC, ' font-weight="700"');
+  });
+
+  svg += '</svg>';
+  return svg;
+}
