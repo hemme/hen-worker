@@ -66,9 +66,12 @@ Options are placed in the path before `hen`, enclosed between `/`:
 
 | Option | Effect |
 |--------|--------|
-| `c` | Show coordinates (column letters + row numbers) |
+| `c`    | Show coordinates (column letters + row numbers) |
+| `x`    | Auto-crop (crops the empty areas of the board around the stones) |
 
-Example: `/c/hen.19x19.b_16DbQw.png`
+Options can be combined.
+
+Example: `/cx/hen.19x19.b_16DbQw.png`
 
 ### HEN String
 
@@ -83,6 +86,9 @@ hen.19x19.b_16Db.png
 
 # With coordinates
 /c/hen.19x19.b_16Db.png
+
+# With coordinates and auto-crop
+/cx/hen.19x19.b_16Db.png
 
 # Full position with last move, ko, and mark
 hen.19x19_19bwb2w3_10Kb_8Kbw_7JbwMw_6Kbw_1Cw3bNwb2.L7.K7w.b.png

@@ -170,6 +170,7 @@ export default {
     }
 
     const showCoordinates = optionsStr.includes('c');
+    const autoCrop = optionsStr.includes('x');
 
     const cache = caches.default;
     let cachedResponse = await cache.match(request);
@@ -178,7 +179,8 @@ export default {
     const henString = pathname.substring(henStartIndex + 4, pathname.length - 4);
 
     try {
-      const svgString = generateGobanSVG(henString, { showCoordinates });
+      const renderResult = generateGobanSVG(henString, { showCoordinates, autoCrop });
+      const svgString = renderResult.svg;
 
       if (!wasmInitialized) {
         await initWasm(wasmModule);
@@ -188,7 +190,7 @@ export default {
       const font = new Uint8Array(fontData);
 
       const resvg = new Resvg(svgString, {
-        fitTo: { mode: 'width', value: 1000 },
+        fitTo: { mode: 'width', value: renderResult.width },
         font: {
           fontBuffers: [font],   // provides the TTF font to Resvg
           defaultFontFamily: 'Roboto',
@@ -445,6 +447,80 @@ function _parseHenRow(part, result) {
 
 // ─── SVG Generation ──────────────────────────────────────────────────────────
 
+function calculateAutoCrop(pos) {
+  var size = pos.size;
+  var board = pos.board;
+  var occupied = [];
+
+  for (var r = 0; r < size; r++) {
+    for (var c = 0; c < size; c++) {
+      if (board[r][c] !== EMPTY) {
+        occupied.push({ row: r, col: c });
+      }
+    }
+  }
+
+  if (pos.marks) {
+    pos.marks.forEach(function (m) { occupied.push({ row: m.row, col: m.col }); });
+  }
+  if (pos.labels) {
+    pos.labels.forEach(function (l) { occupied.push({ row: l.row, col: l.col }); });
+  }
+  if (pos.numberedStones) {
+    pos.numberedStones.forEach(function (ns) { occupied.push({ row: ns.row, col: ns.col }); });
+  }
+  if (pos.lastMove && !pos.lastMove.pass && pos.lastMove.row >= 0 && pos.lastMove.row < size && pos.lastMove.col >= 0 && pos.lastMove.col < size) {
+    occupied.push({ row: pos.lastMove.row, col: pos.lastMove.col });
+  }
+
+  if (occupied.length === 0) return null;
+
+  var minRow = size, maxRow = 0;
+  var minCol = size, maxCol = 0;
+  for (var i = 0; i < occupied.length; i++) {
+    var r = occupied[i].row;
+    var c = occupied[i].col;
+    minRow = Math.min(minRow, r);
+    maxRow = Math.max(maxRow, r);
+    minCol = Math.min(minCol, c);
+    maxCol = Math.max(maxCol, c);
+  }
+
+  var rowStart = Math.max(0, minRow - 2.5);
+  var rowEnd = Math.min(size - 1, maxRow + 2.5);
+  var colStart = Math.max(0, minCol - 2.5);
+  var colEnd = Math.min(size - 1, maxCol + 2.5);
+
+  var edge = Math.min(4, size - 1);
+  function hasContent(rMin, rMax, cMin, cMax) {
+    for (var i = 0; i < occupied.length; i++) {
+      var r = occupied[i].row;
+      var c = occupied[i].col;
+      if (r >= rMin && r <= rMax && c >= cMin && c <= cMax) return true;
+    }
+    return false;
+  }
+
+  if (hasContent(0, edge, 0, edge)) {
+    rowStart = 0; colStart = 0;
+  }
+  if (hasContent(0, edge, size - 1 - edge, size - 1)) {
+    rowStart = 0; colEnd = size - 1;
+  }
+  if (hasContent(size - 1 - edge, size - 1, 0, edge)) {
+    rowEnd = size - 1; colStart = 0;
+  }
+  if (hasContent(size - 1 - edge, size - 1, size - 1 - edge, size - 1)) {
+    rowEnd = size - 1; colEnd = size - 1;
+  }
+
+  if (rowStart === 0 && rowEnd === size - 1 && colStart === 0 && colEnd === size - 1) {
+    return null;
+  }
+
+  return { rowStart: rowStart, rowEnd: rowEnd, colStart: colStart, colEnd: colEnd };
+}
+
 // Helper: emits an SVG <text> element with Roboto font
 function svgText(x, y, content, fontSize, fill, extraAttrs) {
   extraAttrs = extraAttrs || '';
@@ -462,7 +538,11 @@ function generateGobanSVG(hen, options) {
   options = options || {};
   var pos = parseHen(hen);
   if (!pos || !pos.board) {
-    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000"><rect width="1000" height="1000" fill="#DCB35C"/></svg>';
+    return {
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000"><rect width="1000" height="1000" fill="#DCB35C"/></svg>',
+      width: 1000,
+      height: 1000
+    };
   }
 
   var size = pos.size;
@@ -478,8 +558,23 @@ function generateGobanSVG(hen, options) {
   var step = boardArea / (size - 1);
   var stoneR = step * 0.46;
 
+  var crop = options.autoCrop ? calculateAutoCrop(pos) : null;
+  var vbX = 0, vbY = 0, vbW = 1000, vbH = 1000;
+
+  if (crop) {
+    var xMin = crop.colStart === 0 ? 0 : pad + crop.colStart * step;
+    var xMax = crop.colEnd === size - 1 ? 1000 : pad + crop.colEnd * step;
+    var yMin = crop.rowStart === 0 ? 0 : pad + crop.rowStart * step;
+    var yMax = crop.rowEnd === size - 1 ? 1000 : pad + crop.rowEnd * step;
+    
+    vbX = xMin;
+    vbY = yMin;
+    vbW = xMax - xMin;
+    vbH = yMax - yMin;
+  }
+
   var svg = '';
-  svg += '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000">';
+  svg += '<svg xmlns="http://www.w3.org/2000/svg" viewBox="' + vbX + ' ' + vbY + ' ' + vbW + ' ' + vbH + '">';
   svg += '<defs>';
   svg += '<linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">';
   svg += '<stop offset="0%" stop-color="#DCB35C"/>';
@@ -644,5 +739,5 @@ function generateGobanSVG(hen, options) {
   });
 
   svg += '</svg>';
-  return svg;
+  return { svg: svg, width: Math.round(vbW), height: Math.round(vbH) };
 }
