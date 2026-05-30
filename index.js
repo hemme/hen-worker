@@ -64,8 +64,8 @@ function insertPngTextChunk(pngBuffer, keyword, text) {
       insertPos = offset;
       break;
     }
-    const chunkDataLen = (pngBuffer[offset] << 24) | (pngBuffer[offset + 1] << 16) |
-                         (pngBuffer[offset + 2] << 8) | pngBuffer[offset + 3];
+    const chunkDataLen = ((pngBuffer[offset] << 24) | (pngBuffer[offset + 1] << 16) |
+                         (pngBuffer[offset + 2] << 8) | pngBuffer[offset + 3]) >>> 0;
     offset += 12 + chunkDataLen;
   }
 
@@ -590,9 +590,6 @@ function generateGobanSVG(hen, options) {
   svg += '<stop offset="40%" stop-color="#e8e4dc"/>';
   svg += '<stop offset="100%" stop-color="#c8c4bc"/>';
   svg += '</radialGradient>';
-  svg += '<filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">';
-  svg += '<feDropShadow dx="2.2" dy="3.3" stdDeviation="3.3" flood-color="#000" flood-opacity="0.35"/>';
-  svg += '</filter>';
   svg += '</defs>';
 
   svg += '<rect width="1000" height="1000" fill="url(#bg)"/>';
@@ -671,9 +668,9 @@ function generateGobanSVG(hen, options) {
 
       svg += '<circle cx="' + sx + '" cy="' + sy + '" r="' + stoneR + '"';
       if (isBlack) {
-        svg += ' fill="url(#bs)" filter="url(#shadow)"/>';
+        svg += ' fill="url(#bs)"/>';
       } else {
-        svg += ' fill="url(#ws)" filter="url(#shadow)"/>';
+        svg += ' fill="url(#ws)"/>';
       }
     }
   }
