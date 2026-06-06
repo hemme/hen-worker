@@ -326,7 +326,7 @@ function _parseHenDotPart(part, result) {
 
   var sizeMatch = part.match(/^(\d+)x(\d+)$/);
   if (sizeMatch) {
-    result.size = parseInt(sizeMatch[1], 10);
+    result.size = Math.max(2, Math.min(parseInt(sizeMatch[1], 10), 100));
     if (!result.board) {
       result.board = Array(result.size).fill(null).map(function () {
         return Array(result.size).fill(EMPTY);
@@ -423,6 +423,7 @@ function _parseHenRow(part, result) {
       var numStart = j;
       while (j < part.length && part[j] >= '0' && part[j] <= '9') j++;
       var count = parseInt(part.slice(numStart, j), 10);
+      count = Math.min(count, result.size + 1);
       for (var k = 1; k < count; k++) {
         if (col < result.size) {
           result.board[rowNum][col] = henStoneToColor(prevStone);
@@ -596,24 +597,34 @@ function generateGobanSVG(hen, options) {
 
   // Create mask to clip the grid under labels
   var labels = pos.labels || [];
-  svg += '<defs>';
-  svg += '<mask id="grid-mask">';
-  svg += '<rect width="1000" height="1000" fill="white"/>';
+  var hasGridMask = false;
   labels.forEach(function (l) {
     if (!board[l.row] || board[l.row][l.col] === EMPTY) {
-      var lx = pad + l.col * step;
-      var ly = pad + l.row * step;
-      var len = l.letter.length;
-      var fs = (step * 0.5) * (len > 4 ? 0.45 : len > 3 ? 0.55 : len > 2 ? 0.65 : len > 1 ? 0.8 : 1);
-      var tw = (fs * 0.65) * len + step * 0.2;
-      var th = fs + step * 0.2;
-      svg += '<rect x="' + (lx - tw / 2) + '" y="' + (ly - th / 2) + '" width="' + tw + '" height="' + th + '" fill="black"/>';
+      hasGridMask = true;
     }
   });
-  svg += '</mask>';
-  svg += '</defs>';
 
-  svg += '<g mask="url(#grid-mask)">';
+  if (hasGridMask) {
+    svg += '<defs>';
+    svg += '<mask id="grid-mask">';
+    svg += '<rect width="1000" height="1000" fill="white"/>';
+    labels.forEach(function (l) {
+      if (!board[l.row] || board[l.row][l.col] === EMPTY) {
+        var lx = pad + l.col * step;
+        var ly = pad + l.row * step;
+        var len = l.letter.length;
+        var fs = (step * 0.5) * (len > 4 ? 0.45 : len > 3 ? 0.55 : len > 2 ? 0.65 : len > 1 ? 0.8 : 1);
+        var tw = (fs * 0.65) * len + step * 0.2;
+        var th = fs + step * 0.2;
+        svg += '<rect x="' + (lx - tw / 2) + '" y="' + (ly - th / 2) + '" width="' + tw + '" height="' + th + '" fill="black"/>';
+      }
+    });
+    svg += '</mask>';
+    svg += '</defs>';
+    svg += '<g mask="url(#grid-mask)">';
+  } else {
+    svg += '<g>';
+  }
   
   // Grid
   svg += '<g stroke="#3d2914" stroke-width="2.0" stroke-linecap="round">';
