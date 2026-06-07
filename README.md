@@ -54,6 +54,18 @@ npm run deploy
 
 On first deploy, Wrangler will prompt you to authenticate with Cloudflare.
 
+Before deploying, the script (`scripts/deploy.mjs`) checks the rate limit configuration stored in KV (`config:limit`, `config:window_minutes`). If a value is **missing or differs** from the defaults defined in `index.js` (20 requests / 240 min), it asks whether to update it.
+
+- In a non-interactive environment (CI, piped stdin) the prompt is skipped and the values are left untouched; use `--yes` to apply the defaults automatically.
+- `--no-config` skips the config sync entirely.
+- `--dry-run` performs a build without deploying or writing to KV.
+
+```bash
+npm run deploy -- --yes        # auto-apply defaults when needed
+npm run deploy -- --no-config  # skip KV config sync, just deploy
+npm run deploy -- --dry-run    # build only, no deploy / no KV writes
+```
+
 ## URL Format
 
 ```
@@ -99,21 +111,38 @@ hen.9x9_9b3w3b_7w5w_5b2w3b2w_3b6w_1b2w3b2w.png
 
 ## Rate Limiting
 
-The Worker enforces IP-based rate limiting using a Cloudflare KV namespace (`RATE_LIMIT`).
+The Worker enforces IP-based rate limiting using a Cloudflare KV namespace (`RATE_LIMIT`). The limit and the window duration are **configurable at runtime** via KV; if the config keys are absent or invalid, the Worker falls back to the built-in defaults.
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `RATE_LIMIT` | 20 | Max requests per IP per window |
-| `RATE_LIMIT_WINDOW` | 60 s | Sliding window duration |
+| KV key | Default | Description |
+|--------|---------|-------------|
+| `config:limit` | `20` | Max requests per IP per window |
+| `config:window_minutes` | `240` | Window duration in minutes (240 = 4 hours) |
 
 - IPv4 addresses are tracked as-is
 - IPv6 addresses are normalized to their `/64` prefix (first 4 blocks), so all devices in the same /64 share the limit
-- When the limit is exceeded, the Worker returns `429 Too Many Requests` with a `Retry-After` header
+- When the limit is exceeded, the Worker returns `429 Too Many Requests` with a `Retry-After` header (seconds) and a message reporting the current limit and window
 - Rate limit state is stored in KV with a TTL slightly above the window duration, so entries auto-expire
+- The config values are cached in memory for 60s per isolate to avoid reading KV on every request
+
+### Updating rate limit config
+
+Change the limit or window at runtime with Wrangler (use the namespace ID from `wrangler.toml`):
+
+```bash
+# Max requests per window
+wrangler kv key put --namespace-id=2882606f6bb941a4b170700de5839cc9 "config:limit" "20"
+
+# Window duration in minutes (240 = 4 hours)
+wrangler kv key put --namespace-id=2882606f6bb941a4b170700de5839cc9 "config:window_minutes" "240"
+```
+
+- If a key is missing, the corresponding default (`20` / `240`) is used.
+- KV is eventually consistent and the in-memory cache adds up to ~60s, so an update may take up to about a minute to take effect across all isolates.
+- To revert a value to its default, delete the key: `wrangler kv key delete --namespace-id=2882606f6bb941a4b170700de5839cc9 "config:limit"`.
 
 ### KV Binding
 
-The `RATE_LIMIT` KV namespace is configured in `wrangler.toml` (see `wrangler.toml.template` for the required structure). The namespace ID must match an existing KV namespace in your Cloudflare account.
+The `RATE_LIMIT` KV namespace is configured in `wrangler.toml` (see `wrangler.toml.template` for the required structure). The same namespace stores both per-IP rate limit state (keys `rate_limit:<ip>`) and the rate limit configuration (keys `config:*`). The namespace ID must match an existing KV namespace in your Cloudflare account.
 
 ## Extracting the HEN String from a PNG
 

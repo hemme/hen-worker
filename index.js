@@ -2,8 +2,14 @@ import { Resvg, initWasm } from '@resvg/resvg-wasm';
 import wasmModule from '@resvg/resvg-wasm/index_bg.wasm';
 import fontData from './fonts/Roboto-Regular.ttf';
 
-const RATE_LIMIT = 20;      // Max allowed requests
-const RATE_LIMIT_WINDOW = 60;     // Time window in seconds (e.g. 1 minute)
+const DEFAULT_RATE_LIMIT = 20;                  // Max requests per window (fallback)
+const DEFAULT_RATE_LIMIT_WINDOW_MINUTES = 240;  // 240 min = 4 ore (fallback)
+
+const CONFIG_KEY_LIMIT = 'config:limit';
+const CONFIG_KEY_WINDOW_MINUTES = 'config:window_minutes';
+
+const CONFIG_CACHE_TTL_MS = 60 * 1000;
+let configCache = null;
 
 const EMPTY = 0;
 const BLACK = 1;
@@ -100,7 +106,38 @@ function getNormalizedIP(request) {
   return ip;
 }
 
+async function loadConfig(env) {
+  const now = Date.now();
+  if (configCache && (now - configCache.fetchedAt) < CONFIG_CACHE_TTL_MS) {
+    return configCache;
+  }
+
+  let limit = DEFAULT_RATE_LIMIT;
+  let windowMinutes = DEFAULT_RATE_LIMIT_WINDOW_MINUTES;
+
+  try {
+    const [limitRaw, windowRaw] = await Promise.all([
+      env.RATE_LIMIT.get(CONFIG_KEY_LIMIT),
+      env.RATE_LIMIT.get(CONFIG_KEY_WINDOW_MINUTES),
+    ]);
+
+    const parsedLimit = limitRaw !== null ? Number(limitRaw) : NaN;
+    if (Number.isFinite(parsedLimit) && parsedLimit > 0) limit = parsedLimit;
+
+    const parsedWindow = windowRaw !== null ? Number(windowRaw) : NaN;
+    if (Number.isFinite(parsedWindow) && parsedWindow > 0) windowMinutes = parsedWindow;
+  } catch (e) {
+    // KV read error: fall back to defaults
+  }
+
+  configCache = { limit, windowMinutes, fetchedAt: now };
+  return configCache;
+}
+
 async function checkRateLimit(request, env, ctx) {
+
+    const cfg = await loadConfig(env);
+    const windowSeconds = cfg.windowMinutes * 60;
 
     // 1. Get the client IP
     const ip = getNormalizedIP(request);
@@ -121,21 +158,21 @@ async function checkRateLimit(request, env, ctx) {
     // 4. Reset or increment logic
     if (!data || now > data.resetTime) {
       // First request or window expired, reset
-      data = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
-      await env.RATE_LIMIT.put(key, JSON.stringify(data), { expirationTtl: RATE_LIMIT_WINDOW + 10 });
+      data = { count: 1, resetTime: now + windowSeconds };
+      await env.RATE_LIMIT.put(key, JSON.stringify(data), { expirationTtl: windowSeconds + 10 });
     } else {
       // Increment the counter
       data.count += 1;
       // Save the new state (use ctx.waitUntil to avoid blocking the response)
-      ctx.waitUntil(env.RATE_LIMIT.put(key, JSON.stringify(data), { expirationTtl: RATE_LIMIT_WINDOW + 10 }));
+      ctx.waitUntil(env.RATE_LIMIT.put(key, JSON.stringify(data), { expirationTtl: windowSeconds + 10 }));
     }
 
     // 5. Check if limit is exceeded
-    if (data.count > RATE_LIMIT) {
-      return new Response("Too many requests. Try again in a minute.", { 
+    if (data.count > cfg.limit) {
+      return new Response(`Rate limit exceeded (${cfg.limit} requests / ${cfg.windowMinutes} min).`, { 
         status: 429, // Too Many Requests
         headers: { 
-          "Retry-After": RATE_LIMIT_WINDOW,
+          "Retry-After": String(windowSeconds),
           "Content-Type": "text/plain"
         }
       });
@@ -146,6 +183,10 @@ async function checkRateLimit(request, env, ctx) {
 
 export default {
   async fetch(request, env, ctx) {
+
+    if (env.LOG_REQUESTS === 'true') {
+      console.log(`[hen] url=${request.url} ip=${getNormalizedIP(request) ?? 'unknown'}`);
+    }
 
     const rateLimitResponse = await checkRateLimit(request,env,ctx);
     if (rateLimitResponse) {

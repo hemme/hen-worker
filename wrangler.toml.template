@@ -8,6 +8,9 @@ rules = [
   { type = "Data", globs = ["**/*.ttf"], fallthrough = true }
 ]
 
+[vars]
+LOG_REQUESTS = "false"
+
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
 id = "YOUR_RATE_LIMIT_KV_ID"
