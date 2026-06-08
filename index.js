@@ -11,6 +11,9 @@ const CONFIG_KEY_WINDOW_MINUTES = 'config:window_minutes';
 const CONFIG_CACHE_TTL_MS = 60 * 1000;
 let configCache = null;
 
+const rateLimitCache = new Map();
+const KV_SYNC_INTERVAL_SECONDS = 60;
+
 const EMPTY = 0;
 const BLACK = 1;
 const WHITE = 2;
@@ -134,51 +137,73 @@ async function loadConfig(env) {
   return configCache;
 }
 
+async function safeKvPut(env, key, value, options) {
+  try {
+    await env.RATE_LIMIT.put(key, value, options);
+  } catch (e) {
+    console.error(`[hen] KV put failed for key ${key}: ${e.message}`);
+  }
+}
+
 async function checkRateLimit(request, env, ctx) {
 
     const cfg = await loadConfig(env);
     const windowSeconds = cfg.windowMinutes * 60;
 
-    // 1. Get the client IP
     const ip = getNormalizedIP(request);
-    
+
     if (!ip) {
       return new Response("Unable to determine IP", { status: 400 });
     }
 
-    // 2. Generate a unique KV key
-    // Format: rate_limit:123.123.123.123
-    // For normalized IPv6: rate_limit:2a01:827:2277:be00::
     const key = `rate_limit:${ip}`;
-    
-    // 3. Read current state from KV
     const now = Math.floor(Date.now() / 1000);
-    let data = await env.RATE_LIMIT.get(key, { type: 'json' });
 
-    // 4. Reset or increment logic
-    if (!data || now > data.resetTime) {
-      // First request or window expired, reset
-      data = { count: 1, resetTime: now + windowSeconds };
-      await env.RATE_LIMIT.put(key, JSON.stringify(data), { expirationTtl: windowSeconds + 10 });
+    const cached = rateLimitCache.get(ip);
+
+    if (cached && now <= cached.resetTime) {
+      cached.count += 1;
+
+      const shouldSync =
+        cached.count === 2 ||
+        now - cached.lastKvSync >= KV_SYNC_INTERVAL_SECONDS ||
+        cached.count > cfg.limit;
+
+      if (shouldSync) {
+        cached.lastKvSync = now;
+        ctx.waitUntil(safeKvPut(env, key, JSON.stringify({ count: cached.count, resetTime: cached.resetTime }), { expirationTtl: windowSeconds + 10 }));
+      }
     } else {
-      // Increment the counter
-      data.count += 1;
-      // Save the new state (use ctx.waitUntil to avoid blocking the response)
-      ctx.waitUntil(env.RATE_LIMIT.put(key, JSON.stringify(data), { expirationTtl: windowSeconds + 10 }));
+      let data = null;
+      try {
+        data = await env.RATE_LIMIT.get(key, { type: 'json' });
+      } catch (e) {
+        // KV read error: fall back to in-memory defaults
+      }
+
+      if (data && now <= data.resetTime) {
+        data.count += 1;
+      } else {
+        data = { count: 1, resetTime: now + windowSeconds };
+      }
+
+      rateLimitCache.set(ip, { count: data.count, resetTime: data.resetTime, lastKvSync: now });
+      ctx.waitUntil(safeKvPut(env, key, JSON.stringify(data), { expirationTtl: windowSeconds + 10 }));
     }
 
-    // 5. Check if limit is exceeded
-    if (data.count > cfg.limit) {
-      return new Response(`Rate limit exceeded (${cfg.limit} requests / ${cfg.windowMinutes} min).`, { 
-        status: 429, // Too Many Requests
-        headers: { 
+    const entry = rateLimitCache.get(ip);
+
+    if (entry.count > cfg.limit) {
+      return new Response(`Rate limit exceeded (${cfg.limit} requests / ${cfg.windowMinutes} min).`, {
+        status: 429,
+        headers: {
           "Retry-After": String(windowSeconds),
           "Content-Type": "text/plain"
         }
       });
     }
 
-    return null; // All good
+    return null;
 }
 
 export default {
