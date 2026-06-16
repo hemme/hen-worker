@@ -225,7 +225,7 @@ export default {
       return new Response('Not Found or Invalid Format', { status: 404 });
     }
 
-    let henStartIndex = pathname.indexOf('/hen');
+    const henStartIndex = pathname.indexOf('/hen');
     if (henStartIndex === -1) {
       return new Response('Not Found or Invalid Format', { status: 404 });
     }
@@ -242,7 +242,9 @@ export default {
     let cachedResponse = await cache.match(request);
     if (cachedResponse) return cachedResponse;
 
-    const henString = pathname.substring(henStartIndex + 4, pathname.length - 4);
+    const henEndSlashIndex = pathname.indexOf('/', henStartIndex + 4);
+    const henEndIndex = henEndSlashIndex !== -1 ? henEndSlashIndex : pathname.length - 4;
+    const henString = pathname.substring(henStartIndex + 4, henEndIndex);
 
     try {
       const renderResult = generateGobanSVG(henString, { showCoordinates, autoCrop });
