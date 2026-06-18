@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",
-    "@resvg/resvg-wasm": "^2.6.2"
+    "@resvg/resvg-wasm": "^2.6.2",
+    "gifenc": "^1.0.3"
   },
   "devDependencies": {
     "wrangler": "^4.18.0"

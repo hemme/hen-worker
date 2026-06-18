@@ -1,14 +1,16 @@
 # HEN Worker
 
-Dynamic rendering service on Cloudflare Workers that generates PNG images of the Goban (Go/Weiqi) from HEN (Hemme Notation) strings.
+Dynamic rendering service on Cloudflare Workers that generates **PNG** or **GIF** images of the Goban (Go/Weiqi) from HEN (Hemme Notation) strings.
 
 ## Architecture
 
-- The Worker intercepts URLs in the format `[options]/hen<hen_string>.png`
+- The Worker intercepts URLs in the format `[options]/hen<hen_string>.<png|gif>`
 - Parses the HEN string and generates a Goban SVG
-- Converts the SVG to PNG via `@resvg/resvg-wasm` (WebAssembly)
-- Embeds the HEN string as a `tEXt` metadata chunk in the PNG (readable with `exiftool`)
-- Serves the PNG with an immutable cache header (1 year)
+- Converts the SVG to a raster image via `@resvg/resvg-wasm` (WebAssembly)
+  - **PNG**: rendered directly by Resvg
+  - **GIF**: rendered to RGBA pixels by Resvg, then quantized + encoded with `gifenc`
+- Embeds the HEN string as metadata: a `tEXt` chunk in PNG, or a Comment Extension in GIF (readable with `exiftool` / a GIF parser)
+- Serves the image with an immutable cache header (1 year)
 - Responds from Cloudflare's edge cache for subsequent requests
 
 ## Prerequisites
@@ -43,6 +45,7 @@ Try with a sample URL:
 
 ```
 http://localhost:8787/hen.19x19.b_16DbQw.png
+http://localhost:8787/hen.19x19.b_16DbQw.gif
 http://localhost:8787/c/hen.19x19.b_16DbQw.png
 ```
 
@@ -69,7 +72,7 @@ npm run deploy -- --dry-run    # build only, no deploy / no KV writes
 ## URL Format
 
 ```
-/[options]/hen<hen_string>.png
+/[options]/hen<hen_string>.<png|gif>
 ```
 
 ### Options
@@ -83,7 +86,7 @@ Options are placed in the path before `hen`, enclosed between `/`:
 
 Options can be combined.
 
-Example: `/cx/hen.19x19.b_16DbQw.png`
+Example: `/cx/hen.19x19.b_16DbQw.png` (or `.gif`)
 
 ### HEN String
 
@@ -144,18 +147,20 @@ wrangler kv key put --namespace-id=2882606f6bb941a4b170700de5839cc9 "config:wind
 
 The `RATE_LIMIT` KV namespace is configured in `wrangler.toml` (see `wrangler.toml.template` for the required structure). The same namespace stores both per-IP rate limit state (keys `rate_limit:<ip>`) and the rate limit configuration (keys `config:*`). The namespace ID must match an existing KV namespace in your Cloudflare account.
 
-## Extracting the HEN String from a PNG
+## Extracting the HEN String from an image
 
-Every generated PNG embeds the original HEN string in a `tEXt` metadata chunk with the keyword `HEN`. You can retrieve it with any tool that reads PNG text chunks.
+Every generated image embeds the original HEN string in its metadata with the keyword `HEN`: a `tEXt` chunk in PNG, or a Comment Extension in GIF.
 
-### exiftool
+### PNG
+
+#### exiftool
 
 ```bash
 exiftool -HEN image.png
 # HEN : .19x19.b_16DbQw
 ```
 
-### Python (Pillow)
+#### Python (Pillow)
 
 ```python
 from PIL import Image
@@ -164,7 +169,7 @@ img = Image.open("image.png")
 print(img.text.get("HEN"))
 ```
 
-### JavaScript (Node.js)
+#### JavaScript (Node.js)
 
 ```js
 import { readFileSync } from "fs";
@@ -175,6 +180,25 @@ const data = readFileSync("image.png");
 const chunks = extractChunks(data).filter(c => c.name === "tEXt");
 const text = Object.fromEntries(chunks.map(c => textChunk.decode(c.data)));
 console.log(text.HEN);
+```
+
+### GIF
+
+The HEN string is stored as a GIF Comment Extension (`HEN: <string>`).
+
+#### Python
+
+```python
+data = open("image.gif", "rb").read()
+i = 6  # skip "GIF89a"
+while data[i] == 0x21 and data[i + 1] == 0xFE:
+    i += 2
+    comment = b""
+    while data[i] != 0:
+        n = data[i]; i += 1
+        comment += data[i:i + n]; i += n
+    i += 1
+    print(comment.decode())
 ```
 
 ## License
@@ -190,3 +214,4 @@ This project uses the following third-party components:
 | [@resvg/resvg-wasm](https://github.com/nicdao/resvg-js) | MPL-2.0 | SVG-to-PNG rendering via WebAssembly |
 | [@resvg/resvg-js](https://github.com/nicdao/resvg-js) | MPL-2.0 | SVG-to-PNG rendering (native bindings) |
 | [Roboto](https://github.com/google/fonts/tree/main/ofl/roboto) | Apache 2.0 | Font used for text rendering |
+| [gifenc](https://github.com/mattdesl/gifenc) | MIT | GIF encoding / color quantization |

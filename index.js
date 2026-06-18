@@ -1,6 +1,7 @@
 import { Resvg, initWasm } from '@resvg/resvg-wasm';
 import wasmModule from '@resvg/resvg-wasm/index_bg.wasm';
 import fontData from './fonts/Roboto-Regular.ttf';
+import { GIFEncoder, quantize, applyPalette } from 'gifenc';
 
 const DEFAULT_RATE_LIMIT = 20;                  // Max requests per window (fallback)
 const DEFAULT_RATE_LIMIT_WINDOW_MINUTES = 240;  // 240 min = 4 ore (fallback)
@@ -92,6 +93,44 @@ function insertPngTextChunk(pngBuffer, keyword, text) {
   result.set(chunk, insertPos);
   result.set(pngBuffer.subarray(insertPos), insertPos + chunkLen);
   return result;
+}
+
+// GIF Comment Extension: inserts a "keyword: text" comment into the data
+// stream, just before the GIF trailer (0x3B). Comment extensions are only
+// valid after the Logical Screen Descriptor / Global Color Table, so they
+// cannot be placed right after the 6-byte header. Comment data is split into
+// sub-blocks of at most 255 bytes, terminated by a 0x00 block.
+function insertGifComment(gifBuffer, keyword, text) {
+  const payload = new TextEncoder().encode(keyword + ': ' + text);
+
+  const subBlocks = [];
+  for (let i = 0; i < payload.length; i += 255) {
+    const chunk = payload.subarray(i, Math.min(i + 255, payload.length));
+    subBlocks.push(chunk);
+  }
+
+  let extLen = 2; // 0x21 introducer + 0xFE comment label
+  for (const block of subBlocks) extLen += 1 + block.length;
+  extLen += 1; // 0x00 block terminator
+
+  // Trailer is the last byte (0x3B); insert the comment right before it.
+  const trailerPos = gifBuffer.length - 1;
+
+  const out = new Uint8Array(gifBuffer.length + extLen);
+  out.set(gifBuffer.subarray(0, trailerPos), 0);
+
+  let pos = trailerPos;
+  out[pos++] = 0x21; // extension introducer
+  out[pos++] = 0xFE; // comment label
+  for (const block of subBlocks) {
+    out[pos++] = block.length;
+    out.set(block, pos);
+    pos += block.length;
+  }
+  out[pos++] = 0x00; // sub-block terminator
+
+  out[trailerPos + extLen] = 0x3B; // trailer
+  return out;
 }
 
 // Normalize IP (truncates IPv6 to /64)
@@ -221,7 +260,13 @@ export default {
     const url = new URL(request.url);
     const pathname = url.pathname; // e.g. /hen.19x19.b_16DbQw.png
 
-    if (!pathname.endsWith('.png')) {
+    const lowerPath = pathname.toLowerCase();
+    let isGif = false;
+    if (lowerPath.endsWith('.png')) {
+      isGif = false;
+    } else if (lowerPath.endsWith('.gif')) {
+      isGif = true;
+    } else {
       return new Response('Not Found or Invalid Format', { status: 404 });
     }
 
@@ -245,7 +290,7 @@ export default {
     const henString = pathname.substring(henStartIndex + 4, pathname.length - 4);
 
     try {
-      const renderResult = generateGobanSVG(henString, { showCoordinates, autoCrop });
+      const renderResult = generateGobanSVG(henString, { showCoordinates, autoCrop, flat: isGif });
       const svgString = renderResult.svg;
 
       if (!wasmInitialized) {
@@ -265,16 +310,40 @@ export default {
           monspaceFamilyType: 'Roboto',
         },
       });
-      let pngBuffer = resvg.render().asPng();
-      pngBuffer = insertPngTextChunk(pngBuffer, 'HEN', henString);
-      pngBuffer = insertPngTextChunk(pngBuffer, 'Software', 'hen-worker (c) 2026 hemme');
 
-      const response = new Response(pngBuffer, {
-        headers: {
-          'Content-Type': 'image/png',
-          'Cache-Control': 'public, max-age=31536000, immutable',
-        },
-      });
+      let response;
+      if (isGif) {
+        const rendered = resvg.render();
+        const rgba = rendered.pixels;
+        const palette = quantize(rgba, 64, { format: 'rgba4444' });
+        const index = applyPalette(rgba, palette, 'rgba4444');
+
+        const gif = GIFEncoder();
+        gif.writeFrame(index, rendered.width, rendered.height, { palette });
+        gif.finish();
+
+        let gifBytes = gif.bytes();
+        gifBytes = insertGifComment(gifBytes, 'HEN', henString);
+        gifBytes = insertGifComment(gifBytes, 'Software', 'hen-worker (c) 2026 hemme');
+
+        response = new Response(gifBytes, {
+          headers: {
+            'Content-Type': 'image/gif',
+            'Cache-Control': 'public, max-age=31536000, immutable',
+          },
+        });
+      } else {
+        let pngBuffer = resvg.render().asPng();
+        pngBuffer = insertPngTextChunk(pngBuffer, 'HEN', henString);
+        pngBuffer = insertPngTextChunk(pngBuffer, 'Software', 'hen-worker (c) 2026 hemme');
+
+        response = new Response(pngBuffer, {
+          headers: {
+            'Content-Type': 'image/png',
+            'Cache-Control': 'public, max-age=31536000, immutable',
+          },
+        });
+      }
 
       ctx.waitUntil(cache.put(request, response.clone()));
 
@@ -642,24 +711,33 @@ function generateGobanSVG(hen, options) {
 
   var svg = '';
   svg += '<svg xmlns="http://www.w3.org/2000/svg" viewBox="' + vbX + ' ' + vbY + ' ' + vbW + ' ' + vbH + '">';
-  svg += '<defs>';
-  svg += '<linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">';
-  svg += '<stop offset="0%" stop-color="#DCB35C"/>';
-  svg += '<stop offset="100%" stop-color="#B8963E"/>';
-  svg += '</linearGradient>';
-  svg += '<radialGradient id="bs" cx="35%" cy="30%" r="80%">';
-  svg += '<stop offset="0%" stop-color="#4a4a4a"/>';
-  svg += '<stop offset="50%" stop-color="#1a1a1a"/>';
-  svg += '<stop offset="100%" stop-color="#0a0a0a"/>';
-  svg += '</radialGradient>';
-  svg += '<radialGradient id="ws" cx="35%" cy="30%" r="80%">';
-  svg += '<stop offset="0%" stop-color="#ffffff"/>';
-  svg += '<stop offset="40%" stop-color="#e8e4dc"/>';
-  svg += '<stop offset="100%" stop-color="#c8c4bc"/>';
-  svg += '</radialGradient>';
-  svg += '</defs>';
 
-  svg += '<rect width="1000" height="1000" fill="url(#bg)"/>';
+  // Flat colors for GIF (no gradients); otherwise gradient definitions.
+  var flat = options.flat;
+  var boardFill = flat ? '#DCB35C' : 'url(#bg)';
+  var blackFill = flat ? '#1a1a1a' : 'url(#bs)';
+  var whiteFill = flat ? '#e8e4dc' : 'url(#ws)';
+
+  if (!flat) {
+    svg += '<defs>';
+    svg += '<linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">';
+    svg += '<stop offset="0%" stop-color="#DCB35C"/>';
+    svg += '<stop offset="100%" stop-color="#B8963E"/>';
+    svg += '</linearGradient>';
+    svg += '<radialGradient id="bs" cx="35%" cy="30%" r="80%">';
+    svg += '<stop offset="0%" stop-color="#4a4a4a"/>';
+    svg += '<stop offset="50%" stop-color="#1a1a1a"/>';
+    svg += '<stop offset="100%" stop-color="#0a0a0a"/>';
+    svg += '</radialGradient>';
+    svg += '<radialGradient id="ws" cx="35%" cy="30%" r="80%">';
+    svg += '<stop offset="0%" stop-color="#ffffff"/>';
+    svg += '<stop offset="40%" stop-color="#e8e4dc"/>';
+    svg += '<stop offset="100%" stop-color="#c8c4bc"/>';
+    svg += '</radialGradient>';
+    svg += '</defs>';
+  }
+
+  svg += '<rect width="1000" height="1000" fill="' + boardFill + '"/>';
 
   // Create mask to clip the grid under labels
   var labels = pos.labels || [];
@@ -745,9 +823,9 @@ function generateGobanSVG(hen, options) {
 
       svg += '<circle cx="' + sx + '" cy="' + sy + '" r="' + stoneR + '"';
       if (isBlack) {
-        svg += ' fill="url(#bs)"/>';
+        svg += ' fill="' + blackFill + '"/>';
       } else {
-        svg += ' fill="url(#ws)"/>';
+        svg += ' fill="' + whiteFill + '"/>';
       }
     }
   }
