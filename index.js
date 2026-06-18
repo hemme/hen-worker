@@ -133,6 +133,54 @@ function insertGifComment(gifBuffer, keyword, text) {
   return out;
 }
 
+// GIF XMP Application Extension: inserts XMP metadata (containing tiff:Software)
+// into the data stream, just before the GIF trailer (0x3B).
+function insertGifXmp(gifBuffer, softwareString) {
+  const xml = `<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:tiff="http://ns.adobe.com/tiff/1.0/">
+   <tiff:Software>${softwareString}</tiff:Software>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`;
+
+  const xmlBytes = new TextEncoder().encode(xml);
+
+  // Create the 258-byte magic trailer
+  const trailer = new Uint8Array(258);
+  trailer[0] = 0x01;
+  trailer[1] = 0xFF;
+  trailer[2] = 0xFE;
+  for (let i = 0; i < 253; i++) {
+    trailer[3 + i] = 0xFD - i;
+  }
+  trailer[256] = 0x00;
+  trailer[257] = 0x00;
+
+  // Header: 0x21 0xFF 0x0B "XMP Data" "XMP"
+  const header = new Uint8Array([
+    0x21, 0xFF, 0x0B,
+    0x58, 0x4D, 0x50, 0x20, 0x44, 0x61, 0x74, 0x61, // "XMP Data"
+    0x58, 0x4D, 0x50 // "XMP"
+  ]);
+
+  const extLen = header.length + xmlBytes.length + trailer.length;
+  const extBlock = new Uint8Array(extLen);
+  extBlock.set(header, 0);
+  extBlock.set(xmlBytes, header.length);
+  extBlock.set(trailer, header.length + xmlBytes.length);
+
+  const trailerPos = gifBuffer.length - 1;
+  const out = new Uint8Array(gifBuffer.length + extLen);
+  out.set(gifBuffer.subarray(0, trailerPos), 0);
+  out.set(extBlock, trailerPos);
+  out[out.length - 1] = 0x3B;
+
+  return out;
+}
+
 // Normalize IP (truncates IPv6 to /64)
 function getNormalizedIP(request) {
   let ip = request.headers.get("CF-Connecting-IP");
@@ -323,8 +371,8 @@ export default {
         gif.finish();
 
         let gifBytes = gif.bytes();
+        gifBytes = insertGifXmp(gifBytes, 'hen-worker (c) 2026 hemme');
         gifBytes = insertGifComment(gifBytes, 'HEN', henString);
-        gifBytes = insertGifComment(gifBytes, 'Software', 'hen-worker (c) 2026 hemme');
 
         response = new Response(gifBytes, {
           headers: {
