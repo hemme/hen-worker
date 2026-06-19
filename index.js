@@ -762,7 +762,7 @@ function generateGobanSVG(hen, options) {
 
   // Flat colors for GIF (no gradients); otherwise gradient definitions.
   var flat = options.flat;
-  var boardFill = flat ? '#DCB35C' : 'url(#bg)';
+  var boardFill = flat ? '#c4a048' : 'url(#bg)';
   var blackFill = flat ? '#1a1a1a' : 'url(#bs)';
   var whiteFill = flat ? '#e8e4dc' : 'url(#ws)';
 
