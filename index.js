@@ -18,6 +18,24 @@ const KV_SYNC_INTERVAL_SECONDS = 60;
 const EMPTY = 0;
 const BLACK = 1;
 const WHITE = 2;
+const RED = 3;
+const GREEN = 4;
+const BLUE = 5;
+const YELLOW = 6;
+const PURPLE = 7;
+
+const STONE_CHARS = 'bwrglyp';
+
+const STONE_STYLES = {
+  1: { ch: 'b', light: '#4a4a4a', mid: '#1a1a1a', dark: '#0a0a0a', lightText: true, offsets: [0, 50, 100] },
+  2: { ch: 'w', light: '#ffffff', mid: '#e8e4dc', dark: '#c8c4bc', lightText: false, offsets: [0, 40, 100] },
+  3: { ch: 'r', light: '#e74c3c', mid: '#c0392b', dark: '#922b21', lightText: true, offsets: [0, 50, 100] },
+  4: { ch: 'g', light: '#2ecc71', mid: '#27ae60', dark: '#1e8449', lightText: true, offsets: [0, 50, 100] },
+  5: { ch: 'l', light: '#3498db', mid: '#2980b9', dark: '#1f618d', lightText: true, offsets: [0, 50, 100] },
+  6: { ch: 'y', light: '#f7dc6f', mid: '#f1c40f', dark: '#d4ac0d', lightText: false, offsets: [0, 50, 100] },
+  7: { ch: 'p', light: '#9b59b6', mid: '#8e44ad', dark: '#6c3483', lightText: true, offsets: [0, 50, 100] }
+};
+
 const HEN_LETTERS = 'ABCDEFGHJKLMNOPQRST';
 const STAR_POINTS = {
   5: [[2, 2]],
@@ -410,9 +428,16 @@ function henLetterToIndex(letter) {
 }
 
 function henStoneToColor(ch) {
-  if (ch === 'b') return BLACK;
-  if (ch === 'w') return WHITE;
-  return EMPTY;
+  switch (ch) {
+    case 'b': return BLACK;
+    case 'w': return WHITE;
+    case 'r': return RED;
+    case 'g': return GREEN;
+    case 'l': return BLUE;
+    case 'y': return YELLOW;
+    case 'p': return PURPLE;
+    default: return EMPTY;
+  }
 }
 
 function parseHen(hen) {
@@ -518,20 +543,20 @@ function _parseHenDotPart(part, result) {
     return;
   }
 
-  if (part === 'b' || part === 'w') {
+  if (part.length === 1 && STONE_CHARS.indexOf(part) !== -1) {
     result.turn = part;
     return;
   }
 
   if (part.length >= 2 && part[0] === 'p') {
     var passStone = part[1];
-    if (passStone === 'b' || passStone === 'w') {
+    if (STONE_CHARS.indexOf(passStone) !== -1) {
       result.lastMove = { color: henStoneToColor(passStone), pass: true };
       return;
     }
   }
 
-  var lastMoveMatch = part.match(/^([A-HJ-T])(\d+)([bw])$/);
+  var lastMoveMatch = part.match(/^([A-HJ-T])(\d+)([bwrglyp])$/);
   if (lastMoveMatch) {
     var col = henLetterToIndex(lastMoveMatch[1]);
     var row = result.size - parseInt(lastMoveMatch[2], 10);
@@ -595,7 +620,7 @@ function _parseHenRow(part, result) {
     if (ch >= 'A' && ch <= 'T' && ch !== 'I') {
       col = henLetterToIndex(ch);
       j++;
-    } else if (ch === 'b' || ch === 'w') {
+    } else if (STONE_CHARS.indexOf(ch) !== -1) {
       if (col < result.size) {
         result.board[rowNum][col] = henStoneToColor(ch);
       }
@@ -763,8 +788,17 @@ function generateGobanSVG(hen, options) {
   // Flat colors for GIF (no gradients); otherwise gradient definitions.
   var flat = options.flat;
   var boardFill = flat ? '#c4a048' : 'url(#bg)';
-  var blackFill = flat ? '#1a1a1a' : 'url(#bs)';
-  var whiteFill = flat ? '#e8e4dc' : 'url(#ws)';
+
+  function stoneStyle(colorInt) {
+    var style = STONE_STYLES[colorInt];
+    if (!style) return 'none';
+    return flat ? style.mid : 'url(#' + style.ch + 's)';
+  }
+
+  function isDarkStone(colorInt) {
+    var style = STONE_STYLES[colorInt];
+    return style ? !!style.lightText : false;
+  }
 
   if (!flat) {
     svg += '<defs>';
@@ -772,16 +806,16 @@ function generateGobanSVG(hen, options) {
     svg += '<stop offset="0%" stop-color="#DCB35C"/>';
     svg += '<stop offset="100%" stop-color="#B8963E"/>';
     svg += '</linearGradient>';
-    svg += '<radialGradient id="bs" cx="35%" cy="30%" r="80%">';
-    svg += '<stop offset="0%" stop-color="#4a4a4a"/>';
-    svg += '<stop offset="50%" stop-color="#1a1a1a"/>';
-    svg += '<stop offset="100%" stop-color="#0a0a0a"/>';
-    svg += '</radialGradient>';
-    svg += '<radialGradient id="ws" cx="35%" cy="30%" r="80%">';
-    svg += '<stop offset="0%" stop-color="#ffffff"/>';
-    svg += '<stop offset="40%" stop-color="#e8e4dc"/>';
-    svg += '<stop offset="100%" stop-color="#c8c4bc"/>';
-    svg += '</radialGradient>';
+
+    Object.keys(STONE_STYLES).forEach(function (key) {
+      var style = STONE_STYLES[key];
+      svg += '<radialGradient id="' + style.ch + 's" cx="35%" cy="30%" r="80%">';
+      svg += '<stop offset="' + style.offsets[0] + '%" stop-color="' + style.light + '"/>';
+      svg += '<stop offset="' + style.offsets[1] + '%" stop-color="' + style.mid + '"/>';
+      svg += '<stop offset="' + style.offsets[2] + '%" stop-color="' + style.dark + '"/>';
+      svg += '</radialGradient>';
+    });
+
     svg += '</defs>';
   }
 
@@ -867,14 +901,7 @@ function generateGobanSVG(hen, options) {
       if (board[r][c] === EMPTY) continue;
       var sx = pad + c * step;
       var sy = pad + r * step;
-      var isBlack = board[r][c] === BLACK;
-
-      svg += '<circle cx="' + sx + '" cy="' + sy + '" r="' + stoneR + '"';
-      if (isBlack) {
-        svg += ' fill="' + blackFill + '"/>';
-      } else {
-        svg += ' fill="' + whiteFill + '"/>';
-      }
+      svg += '<circle cx="' + sx + '" cy="' + sy + '" r="' + stoneR + '" fill="' + stoneStyle(board[r][c]) + '"/>';
     }
   }
 
@@ -886,8 +913,8 @@ function generateGobanSVG(hen, options) {
     if (!hasLabelOnLastMove) {
       var lmx = pad + lastMove.col * step;
       var lmy = pad + lastMove.row * step;
-      var isBlackLast = board[lastMove.row][lastMove.col] === BLACK;
-      var markStroke = isBlackLast ? '#FFFFFF' : '#3D2914';
+      var isDarkLast = isDarkStone(board[lastMove.row][lastMove.col]);
+      var markStroke = isDarkLast ? '#FFFFFF' : '#3D2914';
       svg += '<circle cx="' + lmx + '" cy="' + lmy + '" r="' + (step * 0.3) + '" fill="none" stroke="' + markStroke + '" stroke-width="' + (step * 0.03) + '"/>';
     }
   }
@@ -896,12 +923,12 @@ function generateGobanSVG(hen, options) {
   marks.forEach(function (m) {
     var mx = pad + m.col * step;
     var my = pad + m.row * step;
-    var isBlackCell = board[m.row] && board[m.row][m.col] === BLACK;
-    var sc = isBlackCell ? '#FFFFFF' : '#3D2914';
+    var isDarkCell = board[m.row] && isDarkStone(board[m.row][m.col]);
+    var sc = isDarkCell ? '#FFFFFF' : '#3D2914';
     var sw = step * 0.08;
 
     if (m.mark === 'CR') {
-      var crSc = isBlackCell ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
+      var crSc = isDarkCell ? 'rgba(255,255,255,0.8)' : 'rgba(0,0,0,0.7)';
       svg += '<circle cx="' + mx + '" cy="' + my + '" r="' + (stoneR * 0.45) + '" fill="none" stroke="' + crSc + '" stroke-width="' + (stoneR * 0.15) + '"/>';
     } else if (m.mark === 'SQ') {
       var sqS = step * 0.22;
@@ -921,8 +948,8 @@ function generateGobanSVG(hen, options) {
   labels.forEach(function (l) {
     var lx = pad + l.col * step;
     var ly = pad + l.row * step;
-    var isBlackCell = board[l.row] && board[l.row][l.col] === BLACK;
-    var fillC = isBlackCell ? '#FFFFFF' : '#3D2914';
+    var isDarkCell = board[l.row] && isDarkStone(board[l.row][l.col]);
+    var fillC = isDarkCell ? '#FFFFFF' : '#3D2914';
     var len = l.letter.length;
     var fs = annTextSize * (len > 4 ? 0.45 : len > 3 ? 0.55 : len > 2 ? 0.65 : len > 1 ? 0.8 : 1);
     svg += svgText(lx, ly, l.letter, fs, fillC, ' font-weight="700"');
@@ -932,8 +959,8 @@ function generateGobanSVG(hen, options) {
   numberedStones.forEach(function (ns) {
     var nx = pad + ns.col * step;
     var ny = pad + ns.row * step;
-    var isBlackCell = board[ns.row] && board[ns.row][ns.col] === BLACK;
-    var fillC = isBlackCell ? '#FFFFFF' : '#3D2914';
+    var isDarkCell = board[ns.row] && isDarkStone(board[ns.row][ns.col]);
+    var fillC = isDarkCell ? '#FFFFFF' : '#3D2914';
     var fs = annTextSize * (ns.number >= 100 ? 0.5 : ns.number >= 10 ? 0.65 : 0.8);
     svg += svgText(nx, ny, ns.number, fs, fillC, ' font-weight="700"');
   });
